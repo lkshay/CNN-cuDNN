@@ -5,12 +5,22 @@
 #include <iostream>
 #include <opencv2/opencv.hpp>
 #include <string>
+#include <random>
+#include <cmath>
 using namespace std;
 using namespace cv;
 #define BATCH_SIZE 1
 
 int gpu_id;
 int device;
+
+
+int roundUp(int num, int den){
+
+  return((num + den - 1 )/(den));
+
+}
+
 
 
 struct convDim_t{
@@ -134,6 +144,8 @@ class ConvLayers{
   convLayerSpec_t layerSpecs;
 
   float* d_output{nullptr};
+  void* d_workspace{nullptr};
+  size_t workspaceBytes{0};
 
   
 
@@ -154,7 +166,11 @@ class ConvLayers{
 
   void getConvLayerSpecs();
 
-	float* buildLayer();
+	void buildConvLayer();
+
+  //void fwdProp();
+
+
 };
 
   void ConvLayers::getConvLayerSpecs(){
@@ -267,11 +283,11 @@ class ConvLayers{
 
   }
 
-  float* ConvLayers::buildLayer(){
+  void ConvLayers::buildConvLayer(){
 
   	// --- Set up the memory required for the convolution --- //
   
-	  size_t workspaceBytes{0};
+	  
     checkCUDNN(cudnnGetConvolutionForwardWorkspaceSize(CUDNN,
                                                      layerSpecs.input_desc,
                                                      layerSpecs.kernel_desc,
@@ -280,26 +296,43 @@ class ConvLayers{
                                                      layerSpecs.convolution_algo,
                                                      &workspaceBytes));
 
-
     // Initialize bias and kernel tensors here //
-    ////////////////////////////////
-    /////////////////////////////////
-    ////////////////////////////////
-    ////////////////////////////
-    /////////////////////////////////
-    ////////////////////////////////
-    //////////////////////////////
-    /////////////////////////////
-    ///////////////////////////
-    /////////////////////////
-    ///////////////////////
-    ////////////////////////
-    ////////////
-    ////////////
-    //
-    ///////
+
+    // Bias
+    cudaMallocManaged(&biasTensor, layerSpecs.outDim.Channels*sizeof(float));
+    cudaMemset(biasTensor,0.01,layerSpecs.outDim.Channels*sizeof(float));
+
+    //Kernel
+
+    random_device rd{};
+    mt19937 gen{rd()};
+
+    // for initialization of weights with gassian distribution with zero mean and variance as one
+    normal_distribution<> d{0,1}; 
 
     
+    float callibrator = (layerIndex != 1) ? sqrt(2 / (inDims.Channels * inDims.Height * inDims.Width)) : 1.0;
+
+    float kernelTemplate[kernelDims.kernelHeight][kernelDims.kernelWidth];
+    for(int i = 0; i < kernelDims.kernelHeight; i++){
+      for(int j = 0; j < kernelDims.kernelWidth; j++){
+        kernelTemplate[i][j] = d(gen) * callibrator;
+      }
+    }
+    float hkernel[kernelDims.kernelSize][inDims.Channels][kernelDims.kernelHeight][kernelDims.kernelWidth];
+
+    for(int i = 0; i < kernelDims.kernelSize; i++){
+      for(int j = 0; j < inDims.Channels; j++){
+        for(int k = 0; k < kernelDims.kernelHeight; k++){
+          for(int l = 0; l < kernelDims.kernelWidth; l++){
+            hkernel[i][j][k][l] = kernelTemplate[k][l];
+          }
+        }
+      }
+    }
+
+    cudaMallocManaged(&kernelTensor, kernelDims.kernelSize * kernelDims.kernelHeight * kernelDims.kernelWidth * sizeof(float));
+    cudaMemcpy(kernelTensor,hkernel,sizeof(hkernel),cudaMemcpyHostToDevice);
 
     /*
     cerr << "Workspace size: " << (workspaceBytes / 1048576.0) << "MB"
@@ -308,7 +341,7 @@ class ConvLayers{
 
     // --- Allocate Memory in the GPU for layer operation --- //
 
-    void* d_workspace{nullptr};
+    
     cudaMallocManaged(&d_workspace, workspaceBytes);
 
     int out_bytes = layerSpecs.outDim.Batch * layerSpecs.outDim.Channels * layerSpecs.outDim.Height * layerSpecs.outDim.Width * sizeof(float);		// memory required for storing output of the layer
@@ -316,49 +349,40 @@ class ConvLayers{
     cudaMallocManaged(&d_output, out_bytes);
     cudaMemset(d_output, 0, out_bytes);
   
-    //////////////////////////////////////////////////////////////////////////
 
-    //These 3 steps will be performed in each epoch: for forward prop
-
-    checkCUDNN(cudnnConvolutionForward(CUDNN,
-                                     &alph,
-                                     input_descriptor,
-                                     inputTensor,
-                                     kernel_descriptor,
-                                     kernelTensor,
-                                     convolution_descriptor,
-                                     convolution_algorithm,
-                                     d_workspace,
-                                     workspaceBytes,
-                                     &bet,
-                                     output_descriptor,
-                                     d_output));
-	  
-    checkCUDNN(cudnnActivationForward(CUDNN,
-                                    activation_descriptor,
-                                    &alph,
-                                    output_descriptor,
-                                    d_output,
-                                    &bet,
-                                    output_descriptor,
-                                    d_output));
-
-    checkCUDNN(cudnnAddTensor(CUDNN, &alph, bias_descriptor,
-                                  biasTensor ,&bet, output_descriptor, d_output));
-
-    cudnnDestroyActivationDescriptor(activation_descriptor);
-
-    cudaDeviceSynchronize();
-    //string str = "./generated_images/afterConvlayer" + to_string(layerIndex) + ".png";
-    //save_image(str, d_output, outDimHeight, outDimWidth);
-    
-    //cudaFree(layerKernel);
-    //cudaFree(d_output);
-    //cudaFree(d_input);
-    return d_output;
 
 }
 
+/*
+void ConvLayers::fwdProp(){
+
+  checkCUDNN(cudnnConvolutionForward(CUDNN,
+                                     &alph,
+                                     layerSpecs.input_desc,
+                                     inputTensor,
+                                     layerSpecs.kernel_desc,
+                                     kernelTensor,
+                                     layerSpecs.convolution_desc,
+                                     layerSpecs.convolution_algo,
+                                     d_workspace,
+                                     workspaceBytes,
+                                     &bet,
+                                     layerSpecs.output_desc,
+                                     d_output));
+
+  checkCUDNN(cudnnActivationForward(CUDNN,
+                                    layerSpecs.activation_desc,
+                                    &alph,
+                                    layerSpecs.output_desc,
+                                    d_output,
+                                    &bet,
+                                    layerSpecs.output_desc,
+                                    d_output));
+
+    checkCUDNN(cudnnAddTensor(CUDNN, &alph, layerSpecs.bias_desc,
+                                  biasTensor ,&bet, layerSpecs.output_desc, d_output));
+}
+*/
 
 int main(int argc, const char* argv[]){
 
