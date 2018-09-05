@@ -10,6 +10,8 @@
 using namespace std;
 using namespace cv;
 #define BATCH_SIZE 1
+#define OVERLAP_POOLING 1
+#define BIAS_INIT_VAL 0.001
 
 int gpu_id;
 int device;
@@ -23,6 +25,8 @@ int roundUp(int num, int den){
 
 
 
+// a struct for outputs & inputs of convolutional layers (including max pool, if exists)
+
 struct convDim_t{
 
   int Height;
@@ -30,6 +34,21 @@ struct convDim_t{
   int Channels;
   int Batch;
 };
+
+// a struct to define pooling layers for a conv layer (if pool is true)
+
+struct poolDim_t{
+
+  int Height;
+  int Width;
+  int padHeight;
+  int padWidth;
+  int strideHeight;
+  int strideWidth;
+
+};
+
+// a struct to define kernel dimensions for a conv operation in a layer
 
 struct kernelDim_t{
 
@@ -44,6 +63,8 @@ struct kernelDim_t{
   int dilationWidth;
 };
 
+// a struct cintaining all the descriptor of an instance of the class conv layers (to be used later when network is made)
+
 struct convLayerSpec_t{
 
   cudnnTensorDescriptor_t input_desc;
@@ -53,9 +74,63 @@ struct convLayerSpec_t{
   cudnnTensorDescriptor_t output_desc;
   cudnnConvolutionFwdAlgo_t convolution_algo;
   cudnnActivationDescriptor_t activation_desc;
+  cudnnPoolingDescriptor_t pooling_desc;
+  cudnnTensorDescriptor_t poolTensor_desc;
   convDim_t outDim;
-
 };
+
+// a function to set the kernel params for a conv operation in a lyer
+
+kernelDim_t setKernelSpecs(int size, int fheight, int fwidth, int sheight, int swidth, int pheight, int pwidth, int dheight, int dwidth){
+
+  kernelDim_t layerKernel;
+  layerKernel.kernelSize = size;
+  layerKernel.kernelHeight = fheight;
+  layerKernel.kernelWidth = fwidth;
+  layerKernel.strideHeight = sheight;
+  layerKernel.strideWidth = swidth;
+  layerKernel.padHeight = pheight;
+  layerKernel.padWidth = pwidth;
+  layerKernel.dilationHeight = dheight;
+  layerKernel.dilationWidth = dwidth;
+
+  return layerKernel;
+}
+
+/*
+int flagOverlap is a flag for setting dimensions ov poolDims. If it is 1, then F=3,S=2 otherwise F=2,S=2.
+It is worth noting that there are only two commonly seen variations of the max pooling layer found in practice: 
+A pooling layer with F=3,S=2 (also called overlapping pooling), and more commonly F=2,S=2. Pooling sizes with larger receptive fields are too destructive.
+*/
+
+// a function to set pool dimensions for a loyer operation, if pool is true
+
+poolDim_t setPoolSpecs(bool flagOverlap){
+
+  poolDim_t poolDims;
+
+  if(flagOverlap){
+
+    poolDims.Height = 3;
+    poolDims.Width = 3;
+    poolDims.padHeight = 1;
+    poolDims.padWidth = 1;
+    poolDims.strideHeight = 2;
+    poolDims.strideWidth = 2;  
+  }
+  else{
+    poolDims.Height = 2;
+    poolDims.Width = 2;
+    poolDims.padHeight = 1;
+    poolDims.padWidth = 1;
+    poolDims.strideHeight = 2;
+    poolDims.strideWidth = 2;
+  }
+
+  return poolDims;
+  
+}
+
 
 #define checkCUDNN(expression)                               \
   {                                                          \
@@ -68,9 +143,9 @@ struct convLayerSpec_t{
   }
 
 
-// --- A function to convert the image to a 3-D array to be passed into the input conv layer --- //
+// --- A function to convert the image to a array to be passed into the input conv layer --- //
 
- float * image2array(Mat image){
+float * image2array(Mat image){
 
   /*
   const int rows = image.rows;
@@ -138,29 +213,39 @@ class ConvLayers{
 	cudnnDataType_t DataType;
 	cudnnConvolutionMode_t ConvMode;
   cudnnActivationMode_t ActivationMode;
+  cudnnPoolingMode_t PoolingMode;
   convDim_t outDims;
   convDim_t inDims;
   kernelDim_t kernelDims;
+  poolDim_t poolDims;
   convLayerSpec_t layerSpecs;
 
-  float* d_output{nullptr};
+  float* conv_output{nullptr};
+  float* poolTensor{nullptr};
   void* d_workspace{nullptr};
   size_t workspaceBytes{0};
 
+  int convOutDimHeight{0}, convOutDimWidth{0}, convOutDimChannels{0}, convOutDimBatchSize{0};
+  int poolOutBatchSize{0}, poolOutChannels{0}, poolOutHeight{0}, poolOutWidth{0};
+
+  bool POOL;  // True if pooling is to be done in this layer, otherwise False
   
 
-	ConvLayers( int index, float* inT, convDim_t inDim, kernelDim_t kdims, int a, int b,
-		cudnnTensorFormat_t t_format, cudnnDataType_t d_type, cudnnConvolutionMode_t c_mode, cudnnActivationMode_t ActMode,cudnnHandle_t cud){
+	ConvLayers( int index, float* inT, convDim_t inDim, kernelDim_t kdims, poolDim_t pdims, int a, int b, bool pool,
+		cudnnTensorFormat_t t_format, cudnnDataType_t d_type, cudnnConvolutionMode_t c_mode, cudnnActivationMode_t ActMode,cudnnPoolingMode_t poolMode, cudnnHandle_t cud){
 
     inputTensor = inT;
     inDims = inDim;
     kernelDims = kdims;
+    poolDims = pdims;
     layerIndex = index;
     alph = a; bet = b;
+    POOL = pool;
 		TensorFormat = t_format;
 		DataType = d_type;			
 		ConvMode = c_mode;
     ActivationMode = ActMode;
+    PoolingMode = poolMode;
 		CUDNN = cud;	
 	}
 
@@ -215,43 +300,48 @@ class ConvLayers{
   // --- This function returns the dimensions of the resulting 4D tensor of a 2D convolution,     //
   // ---given the convolution descriptor, the input tensor descriptor and the filter descriptor --- //
 
-  int outDimHeight{0}, outDimWidth{0}, outDimChannels{0}, outDimBatchSize{0};
+  
 
   checkCUDNN(cudnnGetConvolution2dForwardOutputDim(convolution_descriptor,
                                                  input_descriptor,
                                                  kernel_descriptor,
-                                                 &outDimBatchSize,
-                                                 &outDimChannels,
-                                                 &outDimHeight,
-                                                 &outDimWidth));
-
+                                                 &convOutDimBatchSize,
+                                                 &convOutDimChannels,
+                                                 &convOutDimHeight,
+                                                 &convOutDimWidth));
+  
+  outDims.Height = convOutDimHeight;
+  outDims.Width = convOutDimWidth;
+  outDims.Channels = convOutDimChannels;
+  outDims.Batch = convOutDimBatchSize;
+  
 
   cudnnTensorDescriptor_t bias_descriptor;
   checkCUDNN(cudnnCreateTensorDescriptor(&bias_descriptor));
   checkCUDNN(cudnnSetTensor4dDescriptor(bias_descriptor,
                                             TensorFormat,
                                             DataType,
-                                            outDimBatchSize, outDimChannels,
-                                            outDimHeight, outDimWidth));
+                                            convOutDimBatchSize,
+                                           convOutDimChannels,
+                                           convOutDimHeight,
+                                           convOutDimWidth));
 
   // ---Build the output Descriptor ---//
 
-  cudnnTensorDescriptor_t output_descriptor;
-  checkCUDNN(cudnnCreateTensorDescriptor(&output_descriptor));
-  checkCUDNN(cudnnSetTensor4dDescriptor(output_descriptor,
+  cudnnTensorDescriptor_t convOutput_descriptor;
+  checkCUDNN(cudnnCreateTensorDescriptor(&convOutput_descriptor));
+  checkCUDNN(cudnnSetTensor4dDescriptor(convOutput_descriptor,
                                       /*format=*/TensorFormat,
                                       /*dataType=*/DataType,
-                                      /*batch_size=*/outDimBatchSize,
-                                      /*channels=*/outDimChannels,
-                                      /*image_height=*/outDimHeight,
-                                      /*image_width=*/outDimWidth));
+                                      /*batch_size,Channels, Height, Width=*/ 
+                                          convOutDimBatchSize,
+                                                 convOutDimChannels,
+                                                 convOutDimHeight,
+                                                 convOutDimWidth));
 
   // -- Size references for next conv layer --- //
 
-  outDims.Height = outDimHeight;
-  outDims.Width = outDimWidth;
-  outDims.Channels = outDimChannels;
-  outDims.Batch = outDimBatchSize;
+  
 
   // --- Determine the Convolution algorithm to be used in CNN layer ---//
 
@@ -260,7 +350,7 @@ class ConvLayers{
                                         input_descriptor,
                                         kernel_descriptor,
                                         convolution_descriptor,
-                                        output_descriptor,
+                                        convOutput_descriptor,
                                         CUDNN_CONVOLUTION_FWD_PREFER_FASTEST,
                                         /*memoryLimitInBytes=*/0,
                                         &convolution_algorithm));
@@ -272,14 +362,75 @@ class ConvLayers{
                                         CUDNN_PROPAGATE_NAN,
                                         /*relu_coef=*/0));
 
+
+  /*
+  Do some adjustment if the output dimension of pooling layer is not an integer (which will give an error) 
+  Each dimension h and w of the output images is computed as followed:
+  outputDim = 1 + (inputDim + 2*padding - windowDim)/poolingStride;
+
+  */
+
   layerSpecs.input_desc = input_descriptor;
   layerSpecs.kernel_desc = kernel_descriptor;
   layerSpecs.convolution_desc = convolution_descriptor;
   layerSpecs.bias_desc = bias_descriptor;
-  layerSpecs.output_desc = output_descriptor;
+  layerSpecs.output_desc = convOutput_descriptor;
   layerSpecs.convolution_algo = convolution_algorithm;
   layerSpecs.activation_desc = activation_descriptor;
   layerSpecs.outDim = outDims;
+
+  // check if the user has asked to create a pooling layer for this conv layer
+  if(POOL){
+
+    if((outDims.Height - poolDims.Height)%2 != 0){
+      poolDims.Height = (poolDims.Height == 2) ? 3 : 2;
+    }
+
+    if((outDims.Width - poolDims.Width)%2 != 0){
+      poolDims.Width = (poolDims.Width == 2) ? 3 : 2;
+    }
+
+    cudnnPoolingDescriptor_t pooling_descriptor;
+    checkCUDNN(cudnnCreatePoolingDescriptor(&pooling_descriptor));
+    checkCUDNN(cudnnSetPooling2dDescriptor(pooling_descriptor,
+                                            PoolingMode,
+                                            CUDNN_NOT_PROPAGATE_NAN,
+                                            poolDims.Height,
+                                            poolDims.Width,
+                                            poolDims.padHeight,
+                                            poolDims.padWidth,
+                                            poolDims.strideHeight,
+                                            poolDims.strideWidth));
+
+    
+
+    checkCUDNN(cudnnGetPooling2dForwardOutputDim(pooling_descriptor,
+                                                  convOutput_descriptor,
+                                                  &poolOutBatchSize,
+                                                  &poolOutChannels,
+                                                  &poolOutHeight,
+                                                  &poolOutWidth));
+
+    cudnnTensorDescriptor_t poolTensor_descriptor;
+    checkCUDNN(cudnnCreateTensorDescriptor(&poolTensor_descriptor));  
+    checkCUDNN(cudnnSetTensor4dDescriptor(poolTensor_descriptor,
+                                          TensorFormat,
+                                          DataType,
+                                          poolOutBatchSize,
+                                          poolOutChannels,
+                                          poolOutHeight,
+                                          poolOutWidth));
+
+    outDims.Batch = poolOutBatchSize;
+    outDims.Channels = poolOutChannels;
+    outDims.Height = poolOutHeight;
+    outDims.Width = poolOutWidth;
+
+
+    layerSpecs.pooling_desc = pooling_descriptor;
+    layerSpecs.poolTensor_desc = poolTensor_descriptor;
+    layerSpecs.outDim = outDims;
+    }
 
   }
 
@@ -299,18 +450,17 @@ class ConvLayers{
     // Initialize bias and kernel tensors here //
 
     // Bias
-    cudaMallocManaged(&biasTensor, layerSpecs.outDim.Channels*sizeof(float));
-    cudaMemset(biasTensor,0.01,layerSpecs.outDim.Channels*sizeof(float));
+    cudaMallocManaged(&biasTensor, layerSpecs.outDim.Channels * layerSpecs.outDim.Batch * sizeof(float));
+    cudaMemset(biasTensor,(float)BIAS_INIT_VAL,layerSpecs.outDim.Channels * layerSpecs.outDim.Batch * sizeof(float)); //initializing all the bias units to BIAS_INIT_VAL
 
     //Kernel
-
     random_device rd{};
     mt19937 gen{rd()};
 
     // for initialization of weights with gassian distribution with zero mean and variance as one
     normal_distribution<> d{0,1}; 
 
-    
+    // callibrator to be multplied with the weights for scaling according to He. et. al. 
     float callibrator = (layerIndex != 1) ? sqrt(2 / (inDims.Channels * inDims.Height * inDims.Width)) : 1.0;
 
     float kernelTemplate[kernelDims.kernelHeight][kernelDims.kernelWidth];
@@ -333,23 +483,27 @@ class ConvLayers{
 
     cudaMallocManaged(&kernelTensor, kernelDims.kernelSize * kernelDims.kernelHeight * kernelDims.kernelWidth * sizeof(float));
     cudaMemcpy(kernelTensor,hkernel,sizeof(hkernel),cudaMemcpyHostToDevice);
-
-    /*
-    cerr << "Workspace size: " << (workspaceBytes / 1048576.0) << "MB"
-            << endl;
-    */
-
-    // --- Allocate Memory in the GPU for layer operation --- //
-
     
+    // --- Allocate Memory in the GPU for layer operation --- //    
     cudaMallocManaged(&d_workspace, workspaceBytes);
+    int convout_bytes = convOutDimBatchSize * convOutDimChannels * convOutDimHeight * convOutDimWidth * sizeof(float);    
+ 
+    // memory required for storing output of the conv operation (after adding bias)
+    cudaMallocManaged(&conv_output, convout_bytes);
+    cudaMemset(conv_output, 0, convout_bytes);
 
-    int out_bytes = layerSpecs.outDim.Batch * layerSpecs.outDim.Channels * layerSpecs.outDim.Height * layerSpecs.outDim.Width * sizeof(float);		// memory required for storing output of the layer
+
+    // set up memory for pool tensor if pool is true
+    if(POOL){
+
+      int poolSize =  layerSpecs.outDim.Batch * layerSpecs.outDim.Channels * layerSpecs.outDim.Height * layerSpecs.outDim.Width * sizeof(float);
+      cudaMallocManaged(&poolTensor,poolSize);
     
-    cudaMallocManaged(&d_output, out_bytes);
-    cudaMemset(d_output, 0, out_bytes);
-  
-
+    }
+    
+    /*
+    cerr << "Workspace size: " << (workspaceBytes / 1048576.0) << "MB" << endl;
+    */
 
 }
 
@@ -368,19 +522,23 @@ void ConvLayers::fwdProp(){
                                      workspaceBytes,
                                      &bet,
                                      layerSpecs.output_desc,
-                                     d_output));
+                                     conv_output));
 
   checkCUDNN(cudnnActivationForward(CUDNN,
                                     layerSpecs.activation_desc,
                                     &alph,
                                     layerSpecs.output_desc,
-                                    d_output,
+                                    conv_output,
                                     &bet,
                                     layerSpecs.output_desc,
-                                    d_output));
+                                    conv_output));
 
-    checkCUDNN(cudnnAddTensor(CUDNN, &alph, layerSpecs.bias_desc,
-                                  biasTensor ,&bet, layerSpecs.output_desc, d_output));
+  checkCUDNN(cudnnAddTensor(CUDNN, &alph, layerSpecs.bias_desc,
+                                  biasTensor ,&bet, layerSpecs.output_desc, conv_output));
+  
+  checkCUDNN(cudnnPoolingForward(CUDNN, layerSpecs.pooling_desc, &alph, layerSpecs.output_desc,
+                                       conv_output, &bet, layerSpecs.poolTensor_desc, poolTensor));
+
 }
 */
 
@@ -405,8 +563,9 @@ int main(int argc, const char* argv[]){
 	cudnnHandle_t cudnn;
   cudnnCreate(&cudnn);
 
-  convDim_t firstLayerInputDims; //dimensions of input to first layer
 
+  convDim_t firstLayerInputDims; //dimensions of input to first layer
+  //The input layer will be set here but will be given in each epoch. shift this for loop
   firstLayerInputDims.Height = image.rows;
   firstLayerInputDims.Width = image.cols;
   firstLayerInputDims.Channels = image.channels();
@@ -422,23 +581,11 @@ int main(int argc, const char* argv[]){
   The input for the next layer is the output of current layer which is returned from the buildConvLayer function
   */
 
-  kernelDim_t layerKernel1;
+  // start with the kernel specs
+  kernelDim_t layerKernel1 = setKernelSpecs(3,5,5,1,1,1,1,1,1);
 
-  layerKernel1.kernelSize = 3;
-  layerKernel1.kernelHeight = 5;
-  layerKernel1.kernelWidth = 5;
-  layerKernel1.strideHeight = 1;
-  layerKernel1.strideWidth = 1;
-  layerKernel1.padHeight = 1;
-  layerKernel1.padWidth = 1;
-  layerKernel1.dilationHeight = 1;
-  layerKernel1.dilationWidth = 1;
-
-  
-
-  // Now create the kernel tensor for layer 1
-
-
+  // set pooling specs
+  poolDim_t poolDim1 = setPoolSpecs((bool)OVERLAP_POOLING); //setting a overlapping pool layer
 
 
 
