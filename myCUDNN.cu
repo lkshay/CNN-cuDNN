@@ -1,4 +1,6 @@
 #include <cudnn.h>
+#include <cublas_v2.h>
+#include <cuda_runtime.h>
 #include <cstdlib>
 #include <cassert>
 #include <cstdlib>
@@ -23,8 +25,6 @@ int roundUp(int num, int den){
 
 }
 
-
-
 // a struct for outputs & inputs of convolutional layers (including max pool, if exists)
 
 struct convDim_t{
@@ -45,7 +45,6 @@ struct poolDim_t{
   int padWidth;
   int strideHeight;
   int strideWidth;
-
 };
 
 // a struct to define kernel dimensions for a conv operation in a layer
@@ -132,15 +131,15 @@ poolDim_t setPoolSpecs(bool flagOverlap){
 }
 
 
-#define checkCUDNN(expression)                               \
-  {                                                          \
-    cudnnStatus_t status = (expression);                     \
-    if (status != CUDNN_STATUS_SUCCESS) {                    \
-      std::cerr << "Error on line " << __LINE__ << ": "      \
-                << cudnnGetErrorString(status) << std::endl; \
-      std::exit(EXIT_FAILURE);                               \
-    }                                                        \
-  }
+#define checkCUDNN(expression)                             \
+{                                                          \
+  cudnnStatus_t status = (expression);                     \
+  if (status != CUDNN_STATUS_SUCCESS) {                    \
+    std::cerr << "Error on line " << __LINE__ << ": "      \
+              << cudnnGetErrorString(status) << std::endl; \
+    std::exit(EXIT_FAILURE);                               \
+  }                                                        \
+}
 
 
 // --- A function to convert the image to a array to be passed into the input conv layer --- //
@@ -231,23 +230,45 @@ class ConvLayers{
   bool POOL;  // True if pooling is to be done in this layer, otherwise False
   
 
-	ConvLayers( int index, float* inT, convDim_t inDim, kernelDim_t kdims, poolDim_t pdims, int a, int b, bool pool,
-		cudnnTensorFormat_t t_format, cudnnDataType_t d_type, cudnnConvolutionMode_t c_mode, cudnnActivationMode_t ActMode,cudnnPoolingMode_t poolMode, cudnnHandle_t cud){
+  /*
+  Constructor overloading for initialiing the class object with or without pooling mode. If the user wants to use pooling layer, use the second signature, otherwise first.  
+  */
 
+	ConvLayers( int index, float* inT, convDim_t inDim, kernelDim_t kdims, int a, int b, 
+		cudnnTensorFormat_t t_format, cudnnDataType_t d_type, cudnnConvolutionMode_t c_mode, cudnnActivationMode_t ActMode, cudnnHandle_t cud){
+
+    POOL = false;
+    inputTensor = inT;
+    inDims = inDim;
+    kernelDims = kdims;
+    
+    layerIndex = index;
+    alph = a; bet = b;
+		TensorFormat = t_format;
+		DataType = d_type;			
+		ConvMode = c_mode;
+    ActivationMode = ActMode;
+		CUDNN = cud;	
+	}
+
+
+  ConvLayers( int index, float* inT, convDim_t inDim, kernelDim_t kdims, poolDim_t pdims, int a, int b, 
+    cudnnTensorFormat_t t_format, cudnnDataType_t d_type, cudnnConvolutionMode_t c_mode, cudnnActivationMode_t ActMode,cudnnPoolingMode_t poolMode, cudnnHandle_t cud){
+
+    POOL = true;
     inputTensor = inT;
     inDims = inDim;
     kernelDims = kdims;
     poolDims = pdims;
     layerIndex = index;
     alph = a; bet = b;
-    POOL = pool;
-		TensorFormat = t_format;
-		DataType = d_type;			
-		ConvMode = c_mode;
+    TensorFormat = t_format;
+    DataType = d_type;      
+    ConvMode = c_mode;
     ActivationMode = ActMode;
     PoolingMode = poolMode;
-		CUDNN = cud;	
-	}
+    CUDNN = cud;  
+  }
 
   void getConvLayerSpecs();
 
@@ -299,8 +320,6 @@ class ConvLayers{
 
   // --- This function returns the dimensions of the resulting 4D tensor of a 2D convolution,     //
   // ---given the convolution descriptor, the input tensor descriptor and the filter descriptor --- //
-
-  
 
   checkCUDNN(cudnnGetConvolution2dForwardOutputDim(convolution_descriptor,
                                                  input_descriptor,
@@ -402,10 +421,8 @@ class ConvLayers{
                                             poolDims.strideHeight,
                                             poolDims.strideWidth));
 
-    
-
     checkCUDNN(cudnnGetPooling2dForwardOutputDim(pooling_descriptor,
-                                                  convOutput_descriptor,
+                                              convOutput_descriptor,
                                                   &poolOutBatchSize,
                                                   &poolOutChannels,
                                                   &poolOutHeight,
@@ -425,7 +442,6 @@ class ConvLayers{
     outDims.Channels = poolOutChannels;
     outDims.Height = poolOutHeight;
     outDims.Width = poolOutWidth;
-
 
     layerSpecs.pooling_desc = pooling_descriptor;
     layerSpecs.poolTensor_desc = poolTensor_descriptor;
@@ -497,14 +513,13 @@ class ConvLayers{
     if(POOL){
 
       int poolSize =  layerSpecs.outDim.Batch * layerSpecs.outDim.Channels * layerSpecs.outDim.Height * layerSpecs.outDim.Width * sizeof(float);
-      cudaMallocManaged(&poolTensor,poolSize);
-    
+      cudaMallocManaged(&poolTensor, poolSize); \
+      cudaMemset(poolTensor, 0, poolSize);
     }
-    
+
     /*
     cerr << "Workspace size: " << (workspaceBytes / 1048576.0) << "MB" << endl;
     */
-
 }
 
 /*
@@ -536,11 +551,24 @@ void ConvLayers::fwdProp(){
   checkCUDNN(cudnnAddTensor(CUDNN, &alph, layerSpecs.bias_desc,
                                   biasTensor ,&bet, layerSpecs.output_desc, conv_output));
   
-  checkCUDNN(cudnnPoolingForward(CUDNN, layerSpecs.pooling_desc, &alph, layerSpecs.output_desc,
+  if(POOL){
+    checkCUDNN(cudnnPoolingForward(CUDNN, layerSpecs.pooling_desc, &alph, layerSpecs.output_desc,
                                        conv_output, &bet, layerSpecs.poolTensor_desc, poolTensor));
+  }
+  
 
 }
 */
+
+
+class FCLayers{
+
+  int inDims;
+  int ouDims;
+
+
+};
+
 
 int main(int argc, const char* argv[]){
 
@@ -561,7 +589,9 @@ int main(int argc, const char* argv[]){
 	//--- Build the Handle for the present layer ---//
 	//--- Common for one GPU Device, and all layers of CNN built on it ---//
 	cudnnHandle_t cudnn;
-  cudnnCreate(&cudnn);
+  checkCUDNN(cudnnCreate(&cudnn));
+  cublasHandle_t cublasHandle;
+  cublasCreate(&cublasHandle);
 
 
   convDim_t firstLayerInputDims; //dimensions of input to first layer
@@ -584,32 +614,31 @@ int main(int argc, const char* argv[]){
   // start with the kernel specs
   kernelDim_t layerKernel1 = setKernelSpecs(3,5,5,1,1,1,1,1,1);
 
-  // set pooling specs
-  poolDim_t poolDim1 = setPoolSpecs((bool)OVERLAP_POOLING); //setting a overlapping pool layer
-
-
+  // set pooling specs like this, if there is a pooling layer after your conv layer
+  // poolDim_t poolDim1 = setPoolSpecs((bool)OVERLAP_POOLING); //setting a overlapping pool layer
 
   /*
-  This is the layout for convolutional layer constructor
+  This is the signature for conv layer without pooling layer in front it.
 
-  ConvLayers layer( int layerIndex,
-  float *inputTensor;  
-  float *kernelTensor,
-  float *biasTensor,    
-  int alph, int bet,
-  cudnnHandle_t CUDNN,
-  cudnnTensorFormat_t TensorFormat,
-  cudnnDataType_t DataType,
-  cudnnConvolutionMode_t ConvMode,
-  cudnnActivationMode_t ActivationMode,
-  convDim_t outDims,
-  convDim_t inDims,
-  kernelDim_t kernelDims);
-  
+    ConvLayers( int index, float* inT, convDim_t inDim, kernelDim_t kdims, int a, int b, bool pool,
+    cudnnTensorFormat_t t_format, cudnnDataType_t d_type, cudnnConvolutionMode_t c_mode, cudnnActivationMode_t ActMode,cudnnPoolingMode_t poolMode, cudnnHandle_t cud);
+
+  This is the signature for conv layer with pooling layer in ffront of it
+
+    ConvLayers( int index, float* inT, convDim_t inDim, kernelDim_t kdims, poolDim_t pdims, int a, int b, bool pool,
+    cudnnTensorFormat_t t_format, cudnnDataType_t d_type, cudnnConvolutionMode_t c_mode, cudnnActivationMode_t ActMode,cudnnPoolingMode_t poolMode, cudnnHandle_t cud); 
   */
+  
+  // Make the architecture
 
+  // This is the convolutional layer constructor (with no pooling layer)
+  ConvLayers convlayer1(1, input_layer1, firstLayerInputDims, layerKernel1, alpha, beta, CUDNN_TENSOR_NHWC, CUDNN_DATA_FLOAT, CUDNN_CROSS_CORRELATION,
+                        CUDNN_ACTIVATION_SIGMOID, cudnn);
+  // with these functions, we allocate the space in GPU for layer operation. 
+  convlayer1.getConvLayerSpecs();
+  convlayer1.buildConvLayer();
 
-
+  // At this point, we have defined the layer, but we havent implemented forward or backward prop. That will be done while we start training, while this is just defination.
 
   cudaDeviceSynchronize();
 
