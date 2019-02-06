@@ -9,11 +9,15 @@
 #include <string>
 #include <random>
 #include <cmath>
+#include <stdio.h>
 using namespace std;
 using namespace cv;
+
+
 #define BATCH_SIZE 1
 #define OVERLAP_POOLING 1
 #define BIAS_INIT_VAL 0.001
+#define MAX_THREADS_PER_BLOCK 1024 // according to GTX 1050 Ti
 
 int gpu_id;
 int device;
@@ -180,27 +184,28 @@ class ConvLayers{
 
   float *inputTensor;                   // pointer to the input tensor. If this is an input layer, convert the cv::Mat image to a 3-D array first and then pass its pointer 
                                         // to the class constructor 
-  	float *kernelTensor;
-  	float *biasTensor;		
-	int layerIndex;
-  	int alph, bet;
-  	cudnnHandle_t CUDNN;
-  	cudnnTensorFormat_t TensorFormat;
-	cudnnDataType_t DataType;
-	cudnnConvolutionMode_t ConvMode;
-  	cudnnActivationMode_t ActivationMode;
-	cudnnPoolingMode_t PoolingMode;
-    convDim_t outDims;
-    convDim_t inDims;
-  	kernelDim_t kernelDims;
-	poolDim_t poolDims;
+  float *kernelTensor;
+  float *biasTensor;		
+  int layerIndex;
+  float alph, bet;
+  cudnnHandle_t CUDNN;
+  cudnnTensorFormat_t TensorFormat;
+  cudnnDataType_t DataType;
+  cudnnConvolutionMode_t ConvMode;
+  cudnnActivationMode_t ActivationMode;
+  cudnnPoolingMode_t PoolingMode;
+  convDim_t outDims;
+  convDim_t inDims;
+  kernelDim_t kernelDims;
+  poolDim_t poolDims;
 
   random_device rd{};
   mt19937 gen{rd()};  
   normal_distribution<> d{0,1}; 
 
-  float* conv_output{nullptr}; // output of convolution
+  float* conv_output{nullptr}; // output of convolution operation
   float* poolTensor{nullptr};  // output of pooling layer, if exists
+  float* outputTensor{nullptr};
   void* d_workspace{nullptr};
   size_t workspaceBytes{0};
 
@@ -218,30 +223,36 @@ class ConvLayers{
   cudnnActivationDescriptor_t activation_descriptor;
   cudnnPoolingDescriptor_t pooling_descriptor;
   cudnnTensorDescriptor_t poolTensor_descriptor;
+
 	  
   /*
-  Constructor overloading for initialiing the class object with or without pooling mode. If the user wants to use pooling layer, use the second signature, otherwise first.
+  Constructor overloading for initialiing the class objefloat *kernelTensor;
+  float *biasTensor;ct with or without pooling mode. If the user wants to use pooling layer, use the second signature, otherwise first.
   The ConvLayers class' objects behave differently when a pool layer is to be used and differently when pool isnt there!
   */
 
-	ConvLayers( int index, float* inT, convDim_t inDim, kernelDim_t kdims, int a, int b, 
+  	// Empty constructor for subclass FCLayers
+  ConvLayers(){}
+
+
+	ConvLayers( int index, float* inT, convDim_t inDim, kernelDim_t kdims, float a, float b, 
 		cudnnTensorFormat_t t_format, cudnnDataType_t d_type, cudnnConvolutionMode_t c_mode, cudnnActivationMode_t ActMode, cudnnHandle_t cud){
 
     this->POOL = false;
     this->inputTensor = inT;
     this->inDims = inDim;
     this->kernelDims = kdims;
-    
+
     this->layerIndex = index;
     this->alph = a; this->bet = b;
-	this->TensorFormat = t_format;
-	this->DataType = d_type;			
-	this->ConvMode = c_mode;
+    this->TensorFormat = t_format;
+    this->DataType = d_type;			
+    this->ConvMode = c_mode;
     this->ActivationMode = ActMode;
-	this->CUDNN = cud;	
+    this->CUDNN = cud;	
 	}
 
-  ConvLayers( int index, float* inT, convDim_t inDim, kernelDim_t kdims, poolDim_t pdims, int a, int b, 
+  ConvLayers( int index, float* inT, convDim_t inDim, kernelDim_t kdims, poolDim_t pdims, float a, float b, 
     cudnnTensorFormat_t t_format, cudnnDataType_t d_type, cudnnConvolutionMode_t c_mode, cudnnActivationMode_t ActMode,cudnnPoolingMode_t poolMode, cudnnHandle_t cud){
 
     this->POOL = true;
@@ -265,7 +276,7 @@ class ConvLayers{
 
   	void fwdProp();
 
-  	void bwdPropo();
+  	void bwdProp();
 
 };
 
@@ -425,9 +436,6 @@ class ConvLayers{
     outDims.Width = poolOutWidth;
 
     }
-
-    
-
   }
 
   void ConvLayers::buildConvLayer(){
@@ -457,7 +465,7 @@ class ConvLayers{
     //normal_distribution<> d{0,1}; 
 
     // callibrator to be multplied with the weights for scaling according to He. et. al. 
-    float callibrator = (layerIndex != 1) ? sqrt(2 / (inDims.Channels * inDims.Height * inDims.Width)) : 1.0;
+    float callibrator = (layerIndex != 1) ? sqrt(2 / (inDims.Channels * kernelDims.kernelHeight * kernelDims.kernelWidth)) : 1.0;
 
     float kernelTemplate[kernelDims.kernelHeight][kernelDims.kernelWidth];
     for(int i = 0; i < kernelDims.kernelHeight; i++){
@@ -540,8 +548,106 @@ void ConvLayers::fwdProp(){
                                   &bet,
                                   poolTensor_descriptor,
                                   poolTensor));
+
+    cudaMallocManaged(&outputTensor,sizeof(poolTensor));
+    cudaMemcpy(outputTensor,poolTensor,sizeof(poolTensor),cudaMemcpyDeviceToDevice);
+
+  }
+  else{
+	
+    cudaMallocManaged(&outputTensor,sizeof(conv_output));
+    cudaMemcpy(outputTensor,conv_output,sizeof(conv_output),cudaMemcpyDeviceToDevice);  	
   }
 
+
+}
+
+
+// __global__
+// void MSE(int num_outputs, float* pred, float* labels, float* cost){
+
+
+// 	int idx = blockIdx.x * blockDim.x + threadIdx.x;
+// 	// int idy = blockIdx.y * blockDim.y + threadIdx.y;
+
+
+// 	if(idx < num_outputs && idy < batch){
+
+// 		cost[idx] += (pred[idx] - labels[idx]) * (pred[idx] - labels[idx]) / num_outputs;
+
+// 	}
+
+// }
+
+// __global__
+// void prepMSE(int outDims, int batch, float *pred, float *labels, float* cost){
+
+// 	int idx = blockIdx.x * blockDim.x + threadIdx.x;
+// 	int idy = blockIdx.y * blockDim.y + threadIdx.y;
+
+	
+// 	for(int i = idy; i < batch; i++){
+// 		for(int j = 0; j < outDims; j++){
+
+// 			cost[i] += (pred[i * outDims + j] - labels[j]);
+// 			cost[i] *= cost[i] / outDims;
+// 		}
+// 	}
+
+// }
+
+// this is del_MSE / del_output = [outDims X batch] matrix
+// but in this applicaton, data is real time, bacth size is 1
+
+__global__
+void dMSE(int outDims, int batch, float* pred, float* labels, float *dcost){
+
+
+	int idx = blockIdx.x * blockDim.x + threadIdx.x;
+	// int idy = blockIdx.y * blockDim.y + threadIdx.y;
+
+	while(idx < outDims * batch){
+
+		dcost[0] += (2 / outDims) * pred[idx];  
+
+	}
+
+	idx = blockIdx.x * blockDim.x + threadIdx.x;
+
+	while(idx < outDims){
+
+		dcost[0] -= 2 * (batch / outDims) * labels[idx];   
+
+	}
+
+
+	// int idx = blockIdx.x * blockDim.x + threadIdx.s;
+
+	// while(idx < outDims * batch){
+
+	// 	dcost[idx] = 0;
+
+	// 	for(int i = idx; i < outDims * batch; i += outDims){
+
+	// 		dcost[idx] += (2/outDims) * (  )
+
+	// 	}
+
+	// }
+	
+}
+
+__global__
+void dReLU(int dims, int batch, float* activations, float* dReLU){
+
+	int idx = blockIdx.x * blockDim.x + threadIdx.x;
+
+	if(idx < dims * batch){
+
+		if(activations[idx] > 0) dReLU[idx] = 1;
+		else dReLU[idx] = 0;
+
+	}
 
 }
 
@@ -549,111 +655,294 @@ void ConvLayers::fwdProp(){
 
 
 
-/*
-void ConvLayers::fwdProp(){
+// account for the batch size here 
 
-  checkCUDNN(cudnnConvolutionForward(CUDNN,
-                                     &alph,
-                                     layerSpecs.input_desc,
-                                     inputTensor,
-                                     layerSpecs.kernel_desc,
-                                     kernelTensor,
-                                     layerSpecs.convolution_desc,
-                                     layerSpecs.convolution_algo,
-                                     d_workspace,
-                                     workspaceBytes,
-                                     &bet,
-                                     layerSpecs.output_desc,
-                                     conv_output));
 
-  checkCUDNN(cudnnActivationForward(CUDNN,
-                                    layerSpecs.activation_desc,
-                                    &alph,
-                                    layerSpecs.output_desc,
-                                    conv_output,
-                                    &bet,
-                                    layerSpecs.output_desc,
-                                    conv_output));
 
-  checkCUDNN(cudnnAddTensor(CUDNN, &alph, layerSpecs.bias_desc,
-                                  biasTensor ,&bet, layerSpecs.output_desc, conv_output));
-  
-  if(POOL){
-    checkCUDNN(cudnnPoolingForward(CUDNN, layerSpecs.pooling_desc, &alph, layerSpecs.output_desc,
-                                       conv_output, &bet, layerSpecs.poolTensor_desc, poolTensor));
-  }
+// __global__
+// void MSEBackProp(int num_outputs, float* batch, float* pred, float* labels, float* del){
+
+// 	int idx = blockIdx.x * blockDim.x + threadIdx.x;
+
+
+// 	if(idx < num_outputs){
+// 		del[idx] += (2/num_outputs) * (pred[idx] - labels[idx]);
+// 	}
+
+// }
+
+
+
+
+void ConvLayers::bwdProp(){
+
 
 }
-*/
 
-class FCLayers{
+
+__global__
+void addBiasFC(int dim1,int dim2, float* bias, float* res){
+
+	int idx = blockIdx.x * blockDim.x + threadIdx.x;
+
+	if(idx < dim1*dim2){
+		res[idx] += bias[idx];
+	}
+}
+
+
+class FCLayers : public ConvLayers{
 
   public:
+
     cublasHandle_t CUBLAS;
     int inDims;
-    float* inputTensor;
-    float* outputTensor;
     int outDims;
-    cudnnActivationMode_t ActivationMode;
-    cudnnActivationDescriptor_t activationDesc;
-    float *weights;
-    float *bias;
+    int batch;
+    float *weights{nullptr};
+    float *dcost{nullptr};
+    float *labels{nullptr};
+    // float *p_act{nullptr};
+    float *nabla_w{nullptr};
+    float *nabla_b{nullptr};
+    float* ones{nullptr};
+    float* d_intermediate{nullptr};
+    float* dReLU_tensor{nullptr};
+		
 
-    // Random nunmber generator for weights
-    random_device rdd{};
-    mt19937 generator{rdd()};
-    normal_distribution<> dist{0,1};
 
+    bool last;
+    // float* outputTensor{nullptr};
+    cudnnTensorDescriptor_t outputTensor_descriptor;
 
-    FCLayers( float* inputTensor_, int inDims_, int outDims_, cudnnActivationMode_t ActivationMode_, cublasHandle_t CUBLAS_){
+    FCLayers( float* inputTensor_, int inDims_, int batch,int outDims_, float alpha, float beta, cudnnActivationMode_t ActivationMode_, 
+    	cudnnTensorFormat_t t_format, cudnnDataType_t d_type,cublasHandle_t CUBLAS_,cudnnHandle_t CUDNN){
 
-      inputTensor = inputTensor_;
-      inDims = inDims_;
-      outDims = outDims_;
-      CUBLAS = CUBLAS_;
-      ActivationMode = ActivationMode_;
+      this->last = false;
+      this->inputTensor = inputTensor_;
+      this->inDims = inDims_;
+      this->batch = batch;
+      this->outDims = outDims_;
+      this->CUBLAS = CUBLAS_;
+      this->ActivationMode = ActivationMode_;      
+      this->alph = alpha;
+      this->bet = beta;
+      this->CUDNN = CUDNN;
+      this->DataType = d_type;
+      this->TensorFormat = t_format;
+    }
 
+    FCLayers( float* inputTensor_, int inDims_, int batch,int outDims_, float alpha, float beta, cudnnActivationMode_t ActivationMode_, 
+    	cudnnTensorFormat_t t_format, cudnnDataType_t d_type,cublasHandle_t CUBLAS_,cudnnHandle_t CUDNN, float* labels){
+
+      this->last = true;
+      this->inputTensor = inputTensor_;
+      this->inDims = inDims_;
+      this->batch = batch;
+      this->outDims = outDims_;
+      this->CUBLAS = CUBLAS_;
+      this->ActivationMode = ActivationMode_;      
+      this->alph = alpha;
+      this->bet = beta;
+      this->CUDNN = CUDNN;
+      this->DataType = d_type;
+      this->TensorFormat = t_format;
     }
 
     void getFCLayerSpecs();
     void buildFCLayer();
+    void fwdProp();
+    void bwdProp();
+
+	private:
+		int numBlocks;
+		int numThreads;
+
 
 };
 
 
 void FCLayers::getFCLayerSpecs(){
 
-  checkCUDNN(cudnnCreateActivationDescriptor(&activationDesc));
-  checkCUDNN(cudnnSetActivationDescriptor(activationDesc,
-                                        ActivationMode,
-                                        CUDNN_PROPAGATE_NAN,
-                                        /*relu_coef=*/0));
+	checkCUDNN(cudnnCreateActivationDescriptor(&activation_descriptor));
+	checkCUDNN(cudnnSetActivationDescriptor(activation_descriptor,
+		                                ActivationMode,
+		                                CUDNN_PROPAGATE_NAN,
+	    	                            /*relu_coef=*/0));
+
+	checkCUDNN(cudnnCreateTensorDescriptor(&outputTensor_descriptor));
+  	checkCUDNN(cudnnSetTensor4dDescriptor(outputTensor_descriptor,
+                                      TensorFormat,
+                                      DataType,
+                                      batch, outDims, 1, 1));
+
+
 }
 
 void FCLayers::buildFCLayer(){
 
-  // Initialization of weight matrix
+	// Initialization of weight matrix
 
-  //Callibrator for weight initialization
-  float callibrator = sqrt(2/inDims);
+	//Callibrator for weight initialization
+	float callibrator = sqrt(2/inDims);
+
+	float *hweights;
+	hweights = (float*)malloc(sizeof(float)*inDims*outDims);
+	for(int i = 0; i < outDims; i++){
+	 hweights[i*outDims + inDims] = d(gen)*callibrator;
+	}
+
+	cudaMallocManaged(&weights, inDims*outDims*sizeof(float));
+	cudaMemcpy(weights, hweights, inDims * outDims * sizeof(float),cudaMemcpyHostToDevice);
+
+	free(hweights);
+	// initialization of bias vector
+	cudaMallocManaged(&biasTensor,outDims*batch*sizeof(float));
+	cudaMemset(biasTensor,BIAS_INIT_VAL,outDims*batch*sizeof(float));
+
+	cudaMallocManaged(&outputTensor,outDims*batch*sizeof(float));
+	// cudaMemset(outputTensor,0,outDims*batch*sizeof(float)); ----- If not using cudaMemset(),
+	// ensure that while performing any operation on it, its multiplicatio coeff is 0, like in cublasSgemm() below, bet is 0 for the same reason
+
+	// Decide the number of threads and blocks based on the size of the output of the FC layer (before adding the bias) for addBiasFC kernel
+	if(batch*outDims <= MAX_THREADS_PER_BLOCK){
+		numThreads = batch*outDims;
+		numBlocks = 1;
+	}
+	else{
+		numBlocks = roundUp(batch*outDims,MAX_THREADS_PER_BLOCK);
+		numThreads = MAX_THREADS_PER_BLOCK;
+	}
+
+	// for back prop 
+	cudaMallocManaged(&ones,sizeof(float) * inDims);
+	cudaMemset(ones,1,sizeof(ones));
+	
+	cudaMallocManaged(&d_intermediate,sizeof(float) * batch);
+
+	cudaMallocManaged(&nabla_w, sizeof(float) * inDims * batch);
+
+	cudaMallocManaged(&nabla_b, sizeof(float) * inDims * batch);	
+
+	cudaMallocManaged(&dReLU_tensor,sizeof(float) * outDims * batch);
+}
 
 
-  float *hweights;
-  hweights = (float*)malloc(sizeof(float)*inDims*outDims);
-  for(int i = 0; i < outDims; i++){
-    hweights[i*outDims + inDims] = dist(generator)*callibrator;
-  }
- 
-  cudaMallocManaged(&weights, inDims*outDims*sizeof(float));
-  cudaMemcpy(weights, hweights, inDims * outDims * sizeof(float),cudaMemcpyHostToDevice);
-  
-  // initialization of bias vector
-  cudaMallocManaged(&bias,outDims*sizeof(float));
-  cudaMemset(bias,BIAS_INIT_VAL,outDims*sizeof(float));
+void FCLayers::fwdProp(){
 
-  cudaMallocManaged(&outputTensor,outDims*sizeof(float));
-  cudaMemset(outputTensor,0,outDims*sizeof(float));
-  
+	// do w'X + b = weights' * input from previous layer + bias
+	// weights = inDims x outDims 
+	// bias = outDims x batch
+	// output = outDims x batch
+
+	cublasSgemm(CUBLAS,
+				CUBLAS_OP_T,CUBLAS_OP_N,
+				outDims, batch, inDims,
+				&alph,
+				weights,inDims,
+				inputTensor,inDims,
+				&bet,
+				outputTensor,outDims);
+	
+	addBiasFC<<<numBlocks,numThreads>>>(outDims,batch,biasTensor,outputTensor);
+	
+	checkCUDNN(cudnnActivationForward(CUDNN,
+									activation_descriptor,
+									&alph,
+									outputTensor_descriptor,
+									outputTensor,
+									&bet,
+									outputTensor_descriptor,
+									outputTensor));
+	
+
+}
+
+
+void FCLayers::bwdProp(){
+
+	if(last == true){
+
+		// find the derivative of the cost function
+		cudaMallocManaged(&dcost,sizeof(float)*outDims);
+		cudaMemset(dcost,0,sizeof(float)*outDims);
+		cudaMallocManaged(&labels,sizeof(float)*outDims);
+
+		this->labels = labels;
+
+		if(outDims * batch <= MAX_THREADS_PER_BLOCK){
+			numThreads = outDims;
+			numBlocks = 1;
+		}
+		else{
+
+			numBlocks = roundUp(outDims*batch,MAX_THREADS_PER_BLOCK);
+			numThreads = MAX_THREADS_PER_BLOCK;
+		}
+
+		// calculate del_MSE / del_output (batched)
+
+		dMSE<<<numBlocks,numThreads>>>(outDims, BATCH_SIZE, outputTensor, labels, dcost);
+
+		// calculate gradient of cost with respect to weights
+
+		// del_MSE/del_w_last_layer = ddMSE * del_activation_last_layer/del_last_layer * del_last/del_w_last_layer 
+
+
+		// calculate del_cost / del_activation = dcost * del_ReLU(z) / del(z) = dcost * dReLU =  [outDims X batchsize]' * [outDims X 1]
+
+
+		// compute derivative of ReLU and store in dReLU_tensor
+		dReLU<<<numBlocks,numThreads>>>(outDims, batch, outputTensor, dReLU_tensor);
+
+		cublasSgemm(CUBLAS,
+				CUBLAS_OP_T,CUBLAS_OP_N,
+				batch, 1, outDims,
+				&alph,
+				dReLU_tensor,outDims,
+				dcost,outDims,
+				&bet,
+				d_intermediate,batch);	
+
+		// d_intermediate is (del_MSE / del_output) * (del_activation / del_input) = [batch X 1]
+
+		// now, del_input / del_weights = output of previous layer = input to this layer, which is already there. Therefore, del_MSE / del_w can be given as d_intermediate * inputTensor
+		// [inDims X 1] * [batch X 1]' = [inDims X batch]
+
+		cublasSgemm(CUBLAS,
+				CUBLAS_OP_N,CUBLAS_OP_T,
+				inDims, batch, 1,
+				&alph,
+				inputTensor, inDims,
+				d_intermediate, batch,
+				&bet,
+				nabla_w, inDims); 
+
+		// calculate gradient of cost with respect to bais
+
+		// d_intermediate can be used to calculate nabla_b as well
+		// nabla_b = d_intermediate * [1 1 1 1.... ]' = [batch X 1] * [inDims X 1]' = [batch X inDims]
+
+		cublasSgemm(CUBLAS,
+				CUBLAS_OP_N,CUBLAS_OP_T,
+				batch, inDims, 1,
+				&alph,
+				d_intermediate, batch,
+				ones, inDims,
+				&bet,
+				nabla_b, batch);
+
+	}
+
+	else{
+
+
+
+	}
+
+	
+
+
 }
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -662,100 +951,159 @@ void FCLayers::buildFCLayer(){
 /////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
 ////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
 
+
+// __global__
+// void trial(int *a, int *b, int M, int N){
+
+// 	int idx = blockIdx.x * blockDim.x + threadIdx.x;
+// 	int idy = blockIdx.x * blockDim.x + threadIdx.x;
+// 	if(idx < M && idy < N){
+
+// 		b[idx] +=  a[idx + M * idy];
+// 		// printf("%d %d\n",idx,idy);
+
+// 	}
+
+
+// }
+
+
+
 int main(int argc, const char* argv[]){
 
 	if (argc < 2) {
-    cerr << "usage: conv <image> [gpu=0] [sigmoid=0]" << endl;
-    exit(EXIT_FAILURE);
-  }
+	    cerr << "usage: conv <image> [gpu=0] [sigmoid=0]" << endl;
+	    exit(EXIT_FAILURE);
+  	}
 
-  gpu_id = (argc > 2) ? std::atoi(argv[2]) : 0;
-  std::cerr << "GPU: " << gpu_id << std::endl;
+  	gpu_id = (argc > 2) ? std::atoi(argv[2]) : 0;
+  	std::cerr << "GPU: " << gpu_id << std::endl;
 
-  cudaSetDevice(gpu_id);
+	cudaSetDevice(gpu_id);
 
 	Mat image = load_image(argv[1]);
 
-  float *inputImage = image2array(image);
+  	float *inputImage = image2array(image);
 	
 	//--- Build the Handle for the present layer ---//
 	//--- Common for one GPU Device, and all layers of CNN built on it ---//
 	cudnnHandle_t cudnn;
-  checkCUDNN(cudnnCreate(&cudnn));
-  cublasHandle_t cublas;
-  cublasCreate(&cublas);
+	checkCUDNN(cudnnCreate(&cudnn));
+	cublasHandle_t cublas;
+	cublasCreate(&cublas);
 
 
-  convDim_t firstLayerInputDims; //dimensions of input to first layer
-  //The input layer will be set here but will be given in each epoch. shift this for loop
-  firstLayerInputDims.Height = image.rows;
-  firstLayerInputDims.Width = image.cols;
-  firstLayerInputDims.Channels = image.channels();
-  firstLayerInputDims.Batch = BATCH_SIZE;
+	convDim_t firstLayerInputDims; //dimensions of input to first layer
+	//The input layer will be set here but will be given in each epoch. shift this for loop
+	firstLayerInputDims.Height = image.rows;
+	firstLayerInputDims.Width = image.cols;
+	firstLayerInputDims.Channels = image.channels();
+	firstLayerInputDims.Batch = BATCH_SIZE;
   
-  float *input_layer1;
-  cudaMallocManaged(&input_layer1,firstLayerInputDims.Height * firstLayerInputDims.Width * firstLayerInputDims.Channels * firstLayerInputDims.Batch * sizeof(float));
-  cudaMemcpy(input_layer1,inputImage,sizeof(inputImage),cudaMemcpyHostToDevice);
+	float *input_layer1;
+	cudaMallocManaged(&input_layer1,firstLayerInputDims.Height * firstLayerInputDims.Width * firstLayerInputDims.Channels * firstLayerInputDims.Batch * sizeof(float));
+	cudaMemcpy(input_layer1,inputImage,sizeof(inputImage),cudaMemcpyHostToDevice);
 
 
-  // start with the kernel specs
-  kernelDim_t layerKernel1 = setKernelSpecs(3,5,5,1,1,1,1,1,1);
+	// start with the kernel specs, according to the following
+	// kernelDim_t setKernelSpecs(int size, int fheight, int fwidth, int sheight, int swidth, int pheight, int pwidth, int dheight, int dwidth)
 
-  ///////////////////////// set pooling specs like this, if there is a pooling layer after your conv layer/////////////////////////////////////////
-  // poolDim_t poolDim1 = setPoolSpecs((bool)OVERLAP_POOLING); //setting a overlapping pool layer
-  ////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
-  
-  /*
-  This is the signature for conv layer without pooling layer after it.
+	kernelDim_t layerKernel1 = setKernelSpecs(3,5,5,2,2,1,1,1,1);
 
-    ConvLayers( int index, float* inT, convDim_t inDim, kernelDim_t kdims, int a, int b,
-    cudnnTensorFormat_t t_format, cudnnDataType_t d_type, cudnnConvolutionMode_t c_mode, cudnnActivationMode_t ActMode,cudnnPoolingMode_t poolMode, cudnnHandle_t cud);
+	///////////////////////// set pooling specs like this, if there is a pooling layer after your conv layer/////////////////////////////////////////
+	// poolDim_t poolDim1 = setPoolSpecs((bool)OVERLAP_POOLING); //setting a overlapping pool layer
+	////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
 
-  This is the signature for conv layer with pooling layer after it
+	/*
+	This is the signature for conv layer without pooling layer after it.
 
-    ConvLayers( int index, float* inT, convDim_t inDim, kernelDim_t kdims, poolDim_t pdims, int a, int b,
-    cudnnTensorFormat_t t_format, cudnnDataType_t d_type, cudnnConvolutionMode_t c_mode, cudnnActivationMode_t ActMode,cudnnPoolingMode_t poolMode, cudnnHandle_t cud); 
-  */
-  
-  // Make the architecture
+	ConvLayers( int index, float* inT, convDim_t inDim, kernelDim_t kdims, int a, int b,
+	cudnnTensorFormat_t t_format, cudnnDataType_t d_type, cudnnConvolutionMode_t c_mode, cudnnActivationMode_t ActMode,cudnnPoolingMode_t poolMode, cudnnHandle_t cud);
 
-  // This is the convolutional layer constructor (without pooling layer)
-  ConvLayers convlayer1(1, input_layer1, firstLayerInputDims, layerKernel1, alpha, beta, CUDNN_TENSOR_NHWC, CUDNN_DATA_FLOAT, CUDNN_CROSS_CORRELATION,
-                        CUDNN_ACTIVATION_RELU, cudnn);
-  // with these functions, we allocate the space in GPU for layer operation. 
-  convlayer1.getConvLayerSpecs();
-  convlayer1.buildConvLayer(); // this is objectName.conv_output. If you have added a pool layer, use objectName.poolTensor as output of this layer for input of next layer 
-                               // Here, memory is allocated and values is initialized to zero but no computation has been done yet.
+	This is the signature for conv layer with pooling layer after it
 
-  convlayer1.fwdProp();
+	ConvLayers( int index, float* inT, convDim_t inDim, kernelDim_t kdims, poolDim_t pdims, int a, int b,
+	cudnnTensorFormat_t t_format, cudnnDataType_t d_type, cudnnConvolutionMode_t c_mode, cudnnActivationMode_t ActMode,cudnnPoolingMode_t poolMode, cudnnHandle_t cud); 
+	*/
 
-  // At this point, we have defined the layer, but we havent implemented forward or backward prop. That will be done while we start training, while this is just defination
-  // memory allocation for forward pass (backward pass to be implemented after ths)
+	// Make the architecture
 
-  // create another layer, this time with pool, therefore the signature of conv constructor will be different from the previous layer (Declare poolDim_t if you want pooling layer)
-  poolDim_t poolDim2 = setPoolSpecs((bool)OVERLAP_POOLING);
+	// This is the convolutional layer constructor (without pooling layer)
+	ConvLayers convlayer1(1, input_layer1, firstLayerInputDims, layerKernel1, alpha, beta, CUDNN_TENSOR_NHWC, CUDNN_DATA_FLOAT, CUDNN_CROSS_CORRELATION,
+	                    CUDNN_ACTIVATION_RELU, cudnn);
+	// with these functions, we allocate the space in GPU for layer operation. 
+	convlayer1.getConvLayerSpecs();
+	convlayer1.buildConvLayer(); // this is objectName.conv_output. If you have added a pool layer, use objectName.poolTensor as output of this layer for input of next layer 
+	                           // Here, memory is allocated and values is initialized to zero but no computation has been done yet.
+	convlayer1.fwdProp();
 
-  kernelDim_t layerKernel2 = setKernelSpecs(3,6,6,1,1,1,1,1,1);
-  ConvLayers convlayer2(2, convlayer1.conv_output, convlayer1.outDims, layerKernel2, poolDim2, alpha, beta, CUDNN_TENSOR_NHWC, CUDNN_DATA_FLOAT, CUDNN_CROSS_CORRELATION,
-                        CUDNN_ACTIVATION_RELU, CUDNN_POOLING_MAX, cudnn);
-  convlayer2.getConvLayerSpecs();
-  convlayer2.buildConvLayer();
+	// At this point, we have defined the layer, but we havent implemented forward or backward prop. That will be done while we start training, while this is just defination
+	// memory allocation for forward pass (backward pass to be implemented after ths)
 
-  // build a fully connected layer
-  int fclayer1_input_dims = convlayer2.outDims.Height * convlayer2.outDims.Width * convlayer2.outDims.Channels; 
+	// create another layer, this time with pool, therefore the signature of conv constructor will be different from the previous layer (Declare poolDim_t
+	// if you want pooling layer)
+	poolDim_t poolDim2 = setPoolSpecs(!(bool)OVERLAP_POOLING);
 
-  FCLayers fclayer1( convlayer2.poolTensor, fclayer1_input_dims, 100 , CUDNN_ACTIVATION_RELU, cublas);
-  fclayer1.getFCLayerSpecs();
-  fclayer1.buildFCLayer();
-
-  int fclayer2_input_dims = fclayer1.outDims;
-
-  FCLayers fclayer2(fclayer1.outputTensor, fclayer2_input_dims, 50, CUDNN_ACTIVATION_RELU, cublas); 
-  fclayer2.getFCLayerSpecs();
-  fclayer2.buildFCLayer();
+	kernelDim_t layerKernel2 = setKernelSpecs(3,5,5,2,2,1,1,1,1);
+	ConvLayers convlayer2(2, convlayer1.conv_output, convlayer1.outDims, layerKernel2, poolDim2, alpha, beta, CUDNN_TENSOR_NHWC, CUDNN_DATA_FLOAT, CUDNN_CROSS_CORRELATION,
+	                    CUDNN_ACTIVATION_RELU, CUDNN_POOLING_MAX, cudnn);
+	convlayer2.getConvLayerSpecs();
+	convlayer2.buildConvLayer();
+	convlayer2.fwdProp();
 
 
-  cudaDeviceSynchronize();
+
+	// FCLayers( float* inputTensor_, int inDims_, int batch,int outDims_, float alpha, float beta, cudnnActivationMode_t ActivationMode_, 
+ 	//    	cudnnTensorFormat_t t_format, cudnnDataType_t d_type,cublasHandle_t CUBLAS_,cudnnHandle_t CUDNN)
+
+	// build a fully connected layer
+	int fclayer1_input_dims = convlayer2.outDims.Height * convlayer2.outDims.Width * convlayer2.outDims.Channels; 
+
+	FCLayers fclayer1( convlayer2.outputTensor, fclayer1_input_dims, BATCH_SIZE, 100 ,1.0, 0.0, CUDNN_ACTIVATION_RELU,CUDNN_TENSOR_NHWC,
+						CUDNN_DATA_FLOAT, cublas,cudnn);
+	fclayer1.getFCLayerSpecs();
+	fclayer1.buildFCLayer();
+	fclayer1.fwdProp();
+
+	// dummy labels
+	float* labels;
+	cudaMallocManaged(&labels, sizeof(float));
+	cudaMemset(labels,1.0,sizeof(float));
+
+	FCLayers fclayer2(fclayer1.outputTensor, fclayer1.outDims, BATCH_SIZE, 1 ,1.0, 0.0, CUDNN_ACTIVATION_RELU,CUDNN_TENSOR_NHWC,
+						CUDNN_DATA_FLOAT, cublas,cudnn, labels);
+	fclayer2.getFCLayerSpecs();
+	fclayer2.buildFCLayer();
+	fclayer2.fwdProp();
+
+	
+
+	float *output_image{nullptr};
+	output_image = (float*)malloc(sizeof(convlayer2.outputTensor));
+	cudaMemcpy(output_image, convlayer2.outputTensor, sizeof(convlayer2.outputTensor),cudaMemcpyDeviceToHost);
+
+	cudaDeviceSynchronize();
+
+
+
+
+	// for(int i = 0; i < 100*1; i++){
+	// 	cout<<output_image[i]<<endl;
+	// }
+	// int dim1 = 10,dim2 = 10;
+
+	// Mat m = Mat(convlayer2.outDims.Width,convlayer2.outDims.Height,CV_8UC1);
+	// memcpy(m.data,output_image,sizeof(output_image));
+
+
+	string output_filename = "/generated_images";
+	// save_image(output_filename, output_image, convlayer2.outDims.Width, convlayer2.outDims.Height);
+	// imwrite(output_filename, m);
+ 	cerr << "Wrote output to " << output_filename << std::endl;
+
+
+	cout<<CUDNN_MAJOR;
+	
 
 	return 0;
 }
